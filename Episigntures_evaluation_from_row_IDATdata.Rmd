@@ -1,0 +1,447 @@
+---
+title: "Episgn_from_row_data"
+author: "Evgeniia Khokhlova"
+date: "10/05/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+getwd()
+```
+
+```{r}
+library(GEOquery)
+library(minfi)
+library(minfiData)
+library(knitr)
+library(limma)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(IlluminaHumanMethylation450kmanifest)
+library(RColorBrewer)
+library(missMethyl)
+library(Gviz)
+library(DMRcate)
+library(stringr)
+library(data.table)
+library(dplyr)
+library(pROC)
+library(caret)
+library(car)
+```
+##Importing data from GEO
+
+Once the data has been downloaded and extracted, there should be a folder that contains all the files necessary to execute the workflow.
+
+
+```{r}
+data <- setwd("/home/jenya/IDAT files")
+list.files(data, recursive = TRUE)
+```
+```{r}
+saveRDS(data, "data.rds")
+readRDS("data.rds")
+```
+
+Get the 450k annotation data
+
+```{r}
+ann450k <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+head(ann450k)
+```
+
+Generate sample_sheet.csv file for further analysis using python package 'methylprep'
+
+```{python}
+# python -m methylprep -v sample_sheet -d /Users/evgeniahohlova/Desktop/Bioinf/Episignatures/GSE97362_RAW/New\ Folder\ With\ Items/IDAT\ files    --create
+```
+
+
+Read in the sample sheet for the experiment
+
+```{r}
+targets <- read.metharray.sheet(data, pattern="samplesheet.csv")
+df <- read.csv("/home/jenya/IDAT files/phenodata table.csv", sep = ";")
+setnames( df, "Disease.state", "Sample_Group")
+targetsX <-  merge(targets, df, by = c( "GSM_ID", "Sample_Name"))
+head(targetsX)
+```
+
+Now that we have imported the information about the samples and where the data is located, we can read the raw intensity signals into R from the IDAT files using the read.metharray.exp function. This creates an RGChannelSet object that contains all the raw intensity data, from both the red and green colour channels, for each of the samples. At this stage, it can be useful to rename the samples with more descriptive names.
+
+```{r}
+rgSet <- read.metharray.exp(targets=targetsX)
+```
+
+```{r}
+saveRDS(rgSet, "rgSet.rds")
+rgSet <- readRDS("rgSet.rds")
+```
+
+# give the samples descriptive names
+
+```{r}
+targetsX$ID <- paste(targetsX$Sample_Group,targetsX$Sample_Name,sep=".")
+
+sampleNames(rgSet) <- targetsX$ID
+rgSet
+```
+
+
+##Quality control
+
+Once the data has been imported into R, we can evaluate its quality. Firstly, we need to calculate detection p-values. We can generate a detection p-value for every CpG in every sample, which is indicative of the quality of the signal. We can generate a detection p-value for every CpG in every sample, which is indicative of the quality of the signal. The method used by minfi to calculate detection p-values compares the total signal (M+U) for each probe to the background signal level, which is estimated from the negative control probes. Very small p-values are indicative of a reliable signal whilst large p-values, for example >0.01, generally indicate a poor quality signal.
+ 
+```{r}
+detP <- detectionP(rgSet)
+head(detP)
+```
+
+```{r}
+saveRDS(detP, "detP.rds")
+detP <- readRDS("detP.rds")
+```
+
+```{r}
+dim(detP)
+```
+
+# examine mean detection p-values across all samples to identify any failed samples
+
+```{r}
+pal <- brewer.pal(8,"Dark2")
+
+barplot(colMeans(detP), col=pal[factor(targetsX$Sample_Group)], las=2, 
+        cex.names=0.8, ylab="Mean detection p-values")
+abline(h=0.05,col="red")
+legend("topleft", legend=levels(factor(targetsX$Sample_Group)), fill=pal,
+       bg="white")
+
+```
+The minfi qcReport function generates many other useful quality control plots. The minfi vignette describes the various plots and how they should be interpreted in detail. Generally, samples that look poor based on mean detection p-value will also look poor using other metrics and it is usually advisable to exclude them from further analysis.
+
+```{r}
+qcReport(rgSet, sampNames=targetsX$ID, sampGroups=targetsX$Sample_Group, 
+         pdf="qcReport.pdf")
+```
+
+```{r}
+# remove poor quality samples
+keep <- colMeans(detP) < 0.05
+rgSet <- rgSet[,keep]
+rgSet
+```
+```{r}
+# remove poor quality samples from targets data
+targetsX <- targetsX[keep,]
+targetsX[,1:5]
+```
+```{r}
+# remove poor quality samples from detection p-value table
+detP <- detP[,keep]
+dim(detP)
+```
+
+## Normalisation
+To minimise the unwanted variation within and between samples, various data normalisations can be applied.
+
+Although there is no single normalisation method that is universally considered best, a recent study by Fortin et al. (2014) has suggested that a good rule of thumb within the minfi framework is that the preprocessFunnorm (Fortin et al. 2014) function is most appropriate for datasets with global methylation differences such as cancer/normal or vastly different tissue types, whilst the preprocessQuantile function (Touleimat and Tost 2012) is more suited for datasets where you do not expect global differences between your samples, for example a single tissue.
+
+```{r}
+# normalize the data; this results in a GenomicRatioSet object
+mSetSq <- preprocessQuantile(rgSet)
+```
+
+```{r}
+saveRDS(mSetSq, "mSetSq.rds")
+mSetSq <- readRDS("mSetSq.rds")
+```
+
+```{r}
+# create a MethylSet object from the raw data for plotting
+mSetRaw <- preprocessRaw(rgSet)
+mSetRaw <- readRDS("mSetRaw.rds")
+```
+
+```{r}
+saveRDS(mSetRaw, "mSetRaw.rds")
+```
+
+```{r}
+# visualise what the data looks like before and after normalisation
+par(mfrow=c(1,2))
+densityPlot(rgSet, sampGroups=targetsX$Sample_Group,main="Raw", legend=FALSE)
+legend("top", legend = levels(factor(targetsX$Sample_Group)), 
+       text.col=brewer.pal(8,"Dark2"))
+densityPlot(getBeta(mSetSq), sampGroups=targetsX$Sample_Group,
+            main="Normalized", legend=FALSE)
+legend("top", legend = levels(factor(targetsX$Sample_Group)), 
+       text.col=brewer.pal(8,"Dark2"))
+```
+##Filtering
+
+Poor performing probes are generally filtered out prior to differential methylation analysis. As the signal from these probes is unreliable, by removing them we perform fewer statistical tests and thus incur a reduced multiple testing penalty. We filter out probes that have failed in one or more samples based on detection p-value.
+
+```{r}
+
+# ensure probes are in the same order in the mSetSq and detP objects
+detP <- detP[match(featureNames(mSetSq),rownames(detP)),] 
+
+# remove any probes that have failed in one or more samples
+keep <- rowSums(detP < 0.01) == ncol(mSetSq) 
+table(keep)
+```
+
+```{r}
+mSetSqFlt <- mSetSq[keep,]
+mSetSqFlt
+```
+
+Filtering  out the probes from the X and Y chromosomes or probes that are known to have common SNPs at the CpG site
+
+```{r}
+keep <- !(featureNames(mSetSqFlt) %in% ann450k$Name[ann450k$chr %in% 
+                                                        c("chrX","chrY")])
+table(keep)
+mSetSqFlt <- mSetSqFlt[keep,]
+```
+
+There is a function in minfi that provides a simple interface for the removal of probes where common SNPs may affect the CpG. You can either remove all probes affected by SNPs (default), or only those with minor allele frequencies greater than a specified value.
+
+
+```{r}
+# remove probes with SNPs at CpG site
+mSetSqFlt <- dropLociWithSnps(mSetSqFlt)
+mSetSqFlt
+```
+
+Once the data has been filtered and normalised, it is often useful to re-examine the MDS plots to see if the relationship between the samples has changed. It is apparent from the new MDS plots that much of the inter-individual variation has been removed as this is no longer the first principal component (Figure 6), likely due to the removal of the SNP-affected CpG probes.
+
+```{r,fig.height=10}
+par(mfrow=c(1,2))
+plotMDS(getM(mSetSqFlt), top=1000, gene.selection="common", 
+        col=pal[factor(targetsX$Sample_Group)], cex=0.8, labels = NULL)
+legend("right", legend=levels(factor(targetsX$Sample_Group)), text.col=pal,
+       cex=0.65, bg="white")
+
+```
+
+The next step is to calculate M-values and beta values. M-values have nicer statistical properties and are thus better for use in statistical analysis of methylation data whilst beta values are easy to interpret and are thus better for displaying data.
+
+```{r}
+# calculate M-values for statistical analysis
+mVals <- getM(mSetSqFlt)
+head(mVals[,1:5])
+saveRDS(mVals, "mVals.rds")
+mVals <- readRDS("mVals.rds")
+```
+
+
+```{r}
+bVals <- getBeta(mSetSqFlt)
+head(bVals[,1:5])
+saveRDS(bVals, "bVals.rds")
+bVals <- readRDS("bVals.rds")
+```
+
+```{r}
+par(mfrow=c(1,2))
+densityPlot(bVals, sampGroups=targetsX$Sample_Group, main="Beta values", 
+            legend=FALSE, xlab="Beta values")
+legend("top", legend = levels(factor(targetsX$Sample_Group)), 
+       text.col=brewer.pal(8,"Dark2"))
+densityPlot(mVals, sampGroups=targetsX$Sample_Group, main="M-values", 
+            legend=FALSE, xlab="M values")
+legend("topleft", legend = levels(factor(targetsX$Sample_Group)), 
+       text.col=brewer.pal(8,"Dark2"))
+```
+
+#Probe-wise differential methylation analysis
+
+We are interested in pairwise comparisons between the six types of disease state with healthy controls. We perform this analysis on the matrix of M-values in limma, obtaining moderated t-statistics and associated p-values for each CpG site.
+
+A convenient way to set up the model when the user has many comparisons of interest that they would like to test is to use a contrasts matrix in conjunction with the design matrix. A contrasts matrix will take linear combinations of the columns of the design matrix corresponding to the comparisons of interest.
+
+```{r}
+# this is the factor of interest
+cellType <- factor(targetsX$Sample_Group)
+
+# use the above to create a design matrix
+designX <- model.matrix(~0+cellType, data=targetsX)
+colnames(designX)[1:6] <- c('CHARGE', 'CHD7_variant', 'Control', 'Kabuki', 'KDM6A_variant', 'KMT2D_variant')
+
+# fit the linear model 
+fitX <- lmFit(mVals, designX)
+
+# create a contrast matrix for specific comparisons
+contMatrix <- makeContrasts(CHARGE-Control, Kabuki-Control, CHD7_variant-Control, KDM6A_variant-Control, KMT2D_variant-Control,  levels=designX)
+contMatrix
+```
+
+```{r}
+# fit the contrasts
+fit2 <- contrasts.fit(fitX, contMatrix)
+fit2 <- eBayes(fit2)
+
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+
+We can extract the tables of differentially expressed CpGs for each comparison, ordered by B-statistic by default, using the topTable function in limma. 
+
+The B-statistic is the log-odds of differential methylation, to order by p-value, the we can specify sort.by="p"; and in most cases, the ordering based on the p-value and ordering based on the B-statistic will be identical.
+The results of the analysis can be saved as a data.frame. The coef parameter explicitly refers to the column in the contrasts matrix which corresponds to the comparison of interest.
+
+```{r}
+# get the table of results for the first contrast
+ann450kSub <- ann450k[match(rownames(mVals),ann450k$Name),
+                      c(1:4,12:19,24:ncol(ann450k))]
+DMPs_CHARGE <- topTable(fit2, num=Inf, coef='CHARGE - Control', genelist=ann450kSub)
+DMPs_Kabuki <- topTable(fit2, num=Inf, coef='Kabuki - Control', genelist=ann450kSub)
+DMPs_CHD7_variant <- topTable(fit2, num=Inf, coef='CHD7_variant - Control', genelist=ann450kSub)
+DMPs_KDM6A <- topTable(fit2, num=Inf, coef='KDM6A_variant - Control', genelist=ann450kSub)
+DMPs_KMT2D <- topTable(fit2, num=Inf, coef='KMT2D_variant - Control', genelist=ann450kSub)
+```
+
+The resulting data.frame can be written to a CSV file.
+
+```{r}
+write.table(DMPs_CHARGE, file="DMPs_CHARGE.csv", sep=",", row.names=FALSE)
+write.table(DMPs_Kabuki, file="DMPs_Kabuki.csv", sep=",", row.names=FALSE)
+write.table(DMPs_CHD7_variant, file="DMPs_CHD7_variant.csv", sep=",", row.names=FALSE)
+write.table(DMPs_KDM6A, file="DMPs_KDM6A.csv", sep=",", row.names=FALSE)
+write.table(DMPs_KMT2D, file="DMPs_KMT2D.csv", sep=",", row.names=FALSE)
+```
+
+Plot sample-wise methylation levels for the top differentially methylated CpG sites to ensure the results make sense. It is easier to interpret methylation levels on the beta value scale, so although the analysis is performed on the M-value scale, we visualise data on the beta value scale. The plotCpg function in minfi is a convenient way to plot the sample-wise beta values stratified by the grouping variable.
+
+```{r}
+# plot the top 4 most significantly differentially methylated CpGs 
+par(mfrow=c(2,2))
+sapply(rownames(DMPs_KMT2D)[1:4], function(cpg){
+  plotCpg(bVals, cpg=cpg, pheno=targetsX$Sample_Group, ylab = "Beta values")
+})
+```
+## Filtering differential methylated episignatures and prepearing them for Random forest classification
+
+```{r}
+DMPs_CHARGE$filtered_var <- -log10(DMPs_CHARGE$P.Value)*abs(DMPs_CHARGE$logFC)
+DMPs_Kabuki$filtered_var <- -log10(DMPs_Kabuki$P.Value)*abs(DMPs_Kabuki$logFC)
+DMPs_CHD7_variant$filtered_var <- -log10(DMPs_CHD7_variant$P.Value)*abs(DMPs_CHD7_variant$logFC)
+DMPs_KDM6A$filtered_var <- -log10(DMPs_KDM6A$P.Value)*abs(DMPs_KDM6A$logFC)
+DMPs_KMT2D$filtered_var <- -log10(DMPs_KMT2D$P.Value)*abs(DMPs_KMT2D$logFC)
+```
+
+```{r}
+CHARGE_top_1000 <- DMPs_CHARGE %>% top_n(1000)
+Kabuki_top_1000 <- DMPs_Kabuki %>% top_n(1000)
+CHD7_variant_top_1000 <- DMPs_CHD7_variant %>% top_n(1000)
+KDM6A_top_1000 <- DMPs_KDM6A %>% top_n(1000)
+KMT2D_top_1000 <- DMPs_KMT2D %>% top_n(1000)
+```
+
+```{r}
+Validation_group <- Validation_group[ , c(' CHARGE.Sample_139', ' CHD7 variant.Sample_130', ' Kabuki.Sample_137', ' KMT2D variant.Sample_102', ' Control.Sample_184')]
+                                
+CHARGE_mVals <- mVals[CHARGE_top_500$Name, ]
+CHARGE_CpG <- t(CHARGE_mVals[ ,2:19])
+
+CHD7_mVals <- mVals[CHD7_variant_top_1000$Name, ]
+CHD7_CpG <- t(CHD7_mVals[ ,21:72])
+
+Kabuki_mVals <- mVals[Kabuki_top_1000$Name, ]
+Kabuki_CpG <- t(Kabuki_mVals[ ,74:83])
+
+KMT2D_mVals <- mVals[KMT2D_top_1000$Name, ]
+KMT2D_CpG <- t(KMT2D_mVals[ ,85:109])
+
+```
+
+# Find the most correlated probes 
+
+```{r}
+
+CHARGE_cor <- cor(CHARGE_CpG)
+CHARGE_cor <- as.matrix(new_x)
+pheatmap(CHARGE_cor, main = 'CHARGE episignatures correlation')
+CHD7_cor <- cor(CHD7_CpG)
+pheatmap(CHD7_cor, main = 'CHD7 variant episignatures correlation')
+Kabuki_Cor <- cor(Kabuki_CpG)
+pheatmap(Kabuki_Cor, main = 'Kabuki variant episignatures correlation')
+KMT2D_cor <- cor(KMT2D_CpG)
+pheatmap(KMT2D_cor, main = 'KMT2D episignatures correlation')
+```
+
+# Remove probes with the correlation more then 0.7 
+
+```{r}
+highlyCorrelated_CHARGE <- findCorrelation(CHARGE_cor, cutoff=abs(0.6))
+highlyCorrelated_CHARGE <- sort(highlyCorrelated_CHARGE)
+reduced_Data_CHARGE <- CHARGE_cor[,-c(highlyCorrelated_CHARGE)]
+
+
+#row.names(samp) <- samp$names
+#samp[1] <- NULL
+ 
+new_var1 <- colnames(as.data.frame(reduced_Data_CHARGE))
+CHARGE_filtered_data <- mVals[new_var1, ]
+#CHARGE_filtered_data <- CHARGE_filtered_data[ ,1:19]
+```
+
+```{r}
+highlyCorrelated_CHD7 <- findCorrelation(CHD7_cor, cutoff=abs(0.6))
+highlyCorrelated_CHD7 <- sort(highlyCorrelated_CHD7)
+reduced_Data_CHD7 <- CHD7_cor[,-c(highlyCorrelated_CHD7)]
+ 
+new_var2 <- colnames(as.data.frame(reduced_Data_CHD7))
+CHD7_filtered_data <- mVals[new_var2, ]
+
+#CHD7_filtered_data <- CHD7_filtered_data[ ,20:72]
+```
+
+```{r}
+highlyCorrelated_KMT2D <- findCorrelation(KMT2D_cor, cutoff=abs(0.6))
+highlyCorrelated_KMT2D <- sort(highlyCorrelated_KMT2D)
+reduced_Data_KMT2D <- KMT2D_cor[,-c(highlyCorrelated_KMT2D)]
+ 
+new_var3 <- colnames(as.data.frame(reduced_Data_KMT2D))
+KMT2D_filtered_data <- mVals[new_var3, ]
+#KMT2D_filtered_data <- KMT2D_filtered_data[ , 84:109]
+```
+
+
+```{r}
+highlyCorrelated_Kabuki <- findCorrelation(Kabuki_Cor, cutoff=abs(0.6))
+highlyCorrelated_Kabuki <- sort(highlyCorrelated_Kabuki)
+reduced_Data_Kabuki <- Kabuki_Cor[,-c(highlyCorrelated_Kabuki)]
+ 
+new_var <- colnames(as.data.frame(reduced_Data_Kabuki))
+Kabuki_filtered_data <- mVals[new_var, ]
+#Kabuki_filtered_data <- Kabuki_filtered_data[ ,73:83]
+```
+
+Save the results to a CSV file.
+```{r}
+write.table(CHARGE_filtered_data, file="CHARGE_cpg.csv", sep=";")
+write.table(CHD7_filtered_data, file="CHD7_cpg.csv", sep=";")
+write.table(KMT2D_filtered_data, file="KMT2D_cpg.csv", sep=";")
+write.table(Kabuki_filtered_data, file="Kabuki_cpg.csv", sep=";")
+
+write.table(Validation_group, file="validation_group.csv", sep=";")
+
+```
+
+This is a table with a features CpG sites which is describes specific syndromes. Using this episigntures next we will try to make a Random Forest classification in python to predict genetic syndromes by CpGs. 
+
+
+
+
+
+
+
+
+
+
